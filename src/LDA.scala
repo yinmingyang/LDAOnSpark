@@ -4,6 +4,7 @@ import breeze.collection.mutable.SparseArray
 import breeze.linalg.SparseVector
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 
 import scala.util.Random
 
@@ -95,7 +96,7 @@ class LDA(var maxIteration: Int,
     this
   }
 
-  def sample(array: Array[Double], samp: Double):Int= {
+/*  def sample(array: Array[Double], samp: Double):Int= {
     var arraySum = array
     var topic = 0
     var find = true
@@ -109,10 +110,25 @@ class LDA(var maxIteration: Int,
       }
     }
     topic
+  }*/
+
+  def sample(array:Array[Double], s:Double):Int={
+    var sum = 0.0
+    var topic = 0
+    var find = true
+    while(find&&topic<array.length){
+      sum+=array(topic)
+      if(s<sum){
+        find=false
+      }else{
+        topic+=1
+      }
+    }
+    topic
   }
 
   /*
-  * Sets whether to use breeze for calculating global count, Using breeze could reduce memory consuming.
+  * Sets whether to use breeze for calculating global count.
   * Default: true.
   * */
   var useBreeze = true
@@ -126,7 +142,7 @@ class LDA(var maxIteration: Int,
   * */
   def updateGlobalCount(iterator: RDD[LDAModel]): Array[Array[Int]]={
     if(useBreeze){
-      iterator.map(model=>{
+      /*iterator.map(model=>{
         var count = new Array[SparseVector[Int]](numOfTopic)
         for(i<-0 until count.length){
           count(i) = new SparseVector[Int](new SparseArray[Int](numOfVoc))
@@ -144,6 +160,17 @@ class LDA(var maxIteration: Int,
           total(i)= x(i)+y(i)
         }
         total
+      }).map(x=>x.toArray)*/
+      iterator.glom().map(array=>{
+        var count = new Array[SparseVector[Int]](numOfTopic).map(x=> SparseVector.zeros[Int](numOfVoc))
+        array.foreach(model=>{
+          for(i<- 0 until model.topic.length){
+            count(model.topic(i))(model.word(i))+=1
+          }
+        })
+        count
+      }).reduce((x,y)=>{
+        x.zip(y).map(xx=> xx._1 + xx._2)
       }).map(x=>x.toArray)
     }else{
       iterator.map(model => {
@@ -171,6 +198,7 @@ class LDA(var maxIteration: Int,
   * */
 
   def run(initialData: RDD[Data]): Result= {
+    require(vocabulary.length>0)
     val sc = initialData.sparkContext
     var iterator = initialData.map(data =>
       LDAModel(data.ID, data.word, new Array[Int](data.word.length), {
@@ -187,7 +215,8 @@ class LDA(var maxIteration: Int,
     while (numIteration < maxIteration) {
       numIteration += 1
 
-      iterator = iterator.mapPartitions(x => {
+
+      val nextIter = iterator.mapPartitions(x => {
         var rand = new Random()
         x.map { model => LDAModel(model.ID, model.word, {
           var nextTopic = new Array[Int](model.topic.length)
@@ -203,13 +232,14 @@ class LDA(var maxIteration: Int,
           nextCount
         })
         }
-      })
+      }).persist
 
-      topicTermCount = updateGlobalCount(iterator)
+      topicTermCount = updateGlobalCount(nextIter)
       val ttCount = sc.broadcast(topicTermCount)
       topicCount = topicTermCount.map(x => x.sum)
       val tCount = sc.broadcast(topicCount)
-      iterator = iterator.map (model =>
+      iterator.unpersist()
+      iterator = nextIter.map (model =>
         LDAModel(model.ID, model.word, model.topic, {
           var nextGamma = Array.ofDim[Double](model.word.length, numOfTopic)
           for (i <- 0 until model.word.length) {
@@ -228,7 +258,16 @@ class LDA(var maxIteration: Int,
           nextGamma.map(x => (x, x.sum)).
             map { case (x, y) => x.map(xx => xx / y)}
         }, model.count)
-      )
+      ).setName("Iter-"+numIteration).
+        persist(StorageLevel.MEMORY_AND_DISK)
+
+      if((!sc.getCheckpointDir.isEmpty) && (numIteration%10==0)) {
+        iterator.checkpoint()
+      }
+
+      iterator.count()
+
+      nextIter.unpersist()
       ttCount.unpersist()
       tCount.unpersist()
     }
@@ -257,6 +296,17 @@ class Result(docTopicProb: RDD[(String, Array[Double])],
              vocabulary: Array[String]) extends Serializable {
 
   /*
+  * Get document-topic probability matrix
+  * */
+  def getDocTopicProb = docTopicProb
+
+
+  /*
+  * Get topic-word probability matrix,
+  * */
+  def getTopicVocProb = topicVocProb
+
+  /*
   * Set the number of words that represents
   * */
   var n = 20
@@ -265,7 +315,7 @@ class Result(docTopicProb: RDD[(String, Array[Double])],
     this
   }
   /*
-  * Set the threshold value of probability. If docTopicProb(d)(k) is bigger than this value, then we regard
+  * Set the threshold value of probability. If docTopicProb(d)(k) is bigger than this value, then
   * document d is related to topic k.
   * */
   var prob = 0.2
@@ -314,7 +364,7 @@ class Result(docTopicProb: RDD[(String, Array[Double])],
   * largest probability, else get all features that the probability is larger than prob.
   * */
 
-  var oneFeature = false
+  var oneFeature = true
   def setFeature(isOneFeature: Boolean)={
     this.oneFeature = isOneFeature
     this
@@ -341,15 +391,15 @@ class Result(docTopicProb: RDD[(String, Array[Double])],
     val numOfTopics = topicFeature.length
     for(i<- 0 until numOfTopics){
       fw.write("Topic"+(i+1)+"\t")
-      topicFeature(i).map(x=>fw.write(x+"\t"))
+      topicFeature(i).foreach(x=>fw.write(x+"\t"))
       fw.write("\r\n")
     }
     fw.write("\r\n\t")
     (1 to numOfTopics).map(x=>fw.write("Topic"+x+"\t"))
-    docFeature.collect.map(line=>{
+    docFeature.collect.foreach(line=>{
       fw.write("\r\n")
       fw.write(line._1+"\t")
-      line._2.map(if(_) fw.write("Y\t") else fw.write("\t"))
+      line._2.foreach(if(_) fw.write("Y\t") else fw.write("\t"))
     })
     fw.close()
   }
